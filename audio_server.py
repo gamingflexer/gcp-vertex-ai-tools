@@ -542,6 +542,60 @@ def list_generated_images(date: str = "") -> str:
 
 
 @mcp.tool()
+def get_upload_url(
+    filename: str,
+    date: str = "",
+    folder: str = "recordings",
+    expiry_minutes: int = 60,
+) -> str:
+    """Get a signed GCS upload URL so you can upload a file directly from your machine.
+
+    Workflow:
+      1. Call get_upload_url(filename="meeting.m4a") → get signedUploadUrl + gcsPath
+      2. Upload from your terminal:
+            curl -X PUT -T meeting.m4a "<signedUploadUrl>" -H "Content-Type: audio/mp4"
+      3. Call transcribe_from_gcs(gcs_path="<gcsPath>") to transcribe
+
+    Args:
+        filename: The filename you'll upload (e.g. meeting.m4a, interview.mp3)
+        date: YYYY-MM-DD folder (default: today UTC)
+        folder: GCS folder prefix — recordings | generated | instagram (default: recordings)
+        expiry_minutes: URL validity in minutes (default: 60)
+    """
+    try:
+        upload_date = date or _today()
+        gcs_path = f"{folder}/{upload_date}/{filename}"
+        mime = _audio_mime(filename)
+
+        credentials, _ = google.auth.default()
+        credentials.refresh(google.auth.transport.requests.Request())
+
+        client = _storage_client()
+        blob = client.bucket(BUCKET).blob(gcs_path)
+
+        upload_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=expiry_minutes),
+            method="PUT",
+            content_type=mime,
+            service_account_email=credentials.service_account_email,
+            access_token=credentials.token,
+        )
+
+        return _ok({
+            "signedUploadUrl": upload_url,
+            "gcsPath": f"gs://{BUCKET}/{gcs_path}",
+            "filename": filename,
+            "contentType": mime,
+            "expiryMinutes": expiry_minutes,
+            "nextStep": f'curl -X PUT -T "{filename}" "{upload_url}" -H "Content-Type: {mime}"',
+            "thenTranscribe": f'transcribe_from_gcs(gcs_path="{gcs_path}")',
+        })
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool()
 def get_signed_url(gcs_path: str, expiry_hours: int = 48) -> str:
     """Get a signed URL for any file in gs://open-files-app.
 
