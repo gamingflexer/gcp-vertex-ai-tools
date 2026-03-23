@@ -12,12 +12,17 @@ Image generation models (from https://ai.google.dev/gemini-api/docs/image-genera
 import os
 import json
 import base64
+import subprocess
+import tempfile
+import shutil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+import requests as http_requests
 import google.auth
 import google.auth.transport.requests
 from google.cloud import storage
+from google.cloud import secretmanager
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part
 from google import genai
@@ -553,6 +558,240 @@ def get_signed_url(gcs_path: str, expiry_hours: int = 48) -> str:
             return json.dumps({"error": f"Not found: gs://{BUCKET}/{gcs_path}"})
         return _ok({"signedUrl": _signed_url(blob, expiry_hours),
                     "gcsPath": f"gs://{BUCKET}/{gcs_path}", "expiryHours": expiry_hours})
+    except Exception as e:
+        return _err(e)
+
+
+# ===========================================================================
+# SECTION 3 — INSTAGRAM REEL / POST DOWNLOAD + TRANSCRIBE
+# ===========================================================================
+
+def _get_instagram_cookies() -> str | None:
+    """Load Instagram cookies from env var or Secret Manager."""
+    # 1. Env var (base64-encoded Netscape cookies.txt)
+    cookies_b64 = os.environ.get("INSTAGRAM_COOKIES_B64", "")
+    if cookies_b64:
+        return base64.b64decode(cookies_b64).decode("utf-8")
+    # 2. Secret Manager secret 'instagram-cookies'
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{PROJECT}/secrets/instagram-cookies/versions/latest"
+        resp = client.access_secret_version(request={"name": name})
+        return resp.payload.data.decode("utf-8")
+    except Exception:
+        return None
+
+
+def _yt_dlp_download(url: str, out_dir: str, cookies_txt_path: str | None = None) -> dict:
+    """Run yt-dlp and return metadata + list of downloaded file paths."""
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--write-info-json",
+        "--write-thumbnail",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "-o", os.path.join(out_dir, "%(title).80s.%(ext)s"),
+        "--no-warnings",
+    ]
+    if cookies_txt_path:
+        cmd += ["--cookies", cookies_txt_path]
+    cmd.append(url)
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"yt-dlp error: {result.stderr[:500]}")
+
+    # Collect downloaded files
+    files = list(Path(out_dir).glob("*"))
+    info_json = next((f for f in files if f.suffix == ".json"), None)
+    metadata = {}
+    if info_json:
+        with open(info_json) as f:
+            raw = json.load(f)
+            metadata = {
+                "title": raw.get("title", ""),
+                "description": raw.get("description", ""),
+                "duration": raw.get("duration"),
+                "uploader": raw.get("uploader", ""),
+                "upload_date": raw.get("upload_date", ""),
+                "like_count": raw.get("like_count"),
+                "view_count": raw.get("view_count"),
+                "thumbnail": raw.get("thumbnail", ""),
+            }
+
+    media_files = [f for f in files if f.suffix in {".mp4", ".jpg", ".jpeg", ".png", ".webp", ".m4a"}]
+    return {"metadata": metadata, "files": media_files}
+
+
+@mcp.tool()
+def download_instagram(
+    url: str,
+    cookies_b64: str = "",
+    transcribe: bool = True,
+    language: str = "en",
+    date: str = "",
+    expiry_hours: int = 48,
+) -> str:
+    """Download an Instagram reel or post (video/images), save to GCS, optionally transcribe.
+
+    Saves to gs://open-files-app/instagram/YYYY-MM-DD/<title>/
+    For videos: also saves transcript as <title>_transcript.txt
+
+    Instagram REQUIRES authentication cookies. Provide them one of three ways:
+    1. cookies_b64 parameter: base64-encoded Netscape cookies.txt content
+    2. Set INSTAGRAM_COOKIES_B64 env var on the server
+    3. Store in Secret Manager secret named 'instagram-cookies'
+
+    To export cookies from Chrome: use the 'Get cookies.txt LOCALLY' browser extension.
+
+    Args:
+        url: Instagram reel or post URL (https://www.instagram.com/p/XXX/)
+        cookies_b64: Base64-encoded Netscape cookies.txt (optional if set server-side)
+        transcribe: Transcribe video audio with Gemini 2.5 Pro (default: True)
+        language: Language code for transcription (default: en)
+        date: YYYY-MM-DD folder (default: today UTC)
+        expiry_hours: Signed URL validity in hours (default: 48)
+    """
+    tmp_dir = None
+    cookies_file = None
+    try:
+        # Resolve cookies
+        cookies_content = None
+        if cookies_b64:
+            cookies_content = base64.b64decode(cookies_b64).decode("utf-8")
+        else:
+            cookies_content = _get_instagram_cookies()
+
+        if not cookies_content:
+            return json.dumps({
+                "error": "Instagram cookies required",
+                "how_to_fix": (
+                    "Export cookies from your browser while logged into Instagram. "
+                    "Use 'Get cookies.txt LOCALLY' Chrome extension → export for instagram.com. "
+                    "Then base64-encode the file: base64 -i cookies.txt | tr -d '\\n' "
+                    "Pass as cookies_b64 parameter, or store in Secret Manager as 'instagram-cookies'."
+                )
+            })
+
+        # Write cookies to temp file
+        cookies_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        cookies_file.write(cookies_content)
+        cookies_file.close()
+
+        # Download to temp dir
+        tmp_dir = tempfile.mkdtemp()
+        result = _yt_dlp_download(url, tmp_dir, cookies_file.name)
+        metadata = result["metadata"]
+        media_files = result["files"]
+
+        if not media_files:
+            return json.dumps({"error": "No media files downloaded", "url": url})
+
+        # Upload to GCS
+        dl_date = date or _today()
+        safe_title = (metadata.get("title") or "instagram").replace("/", "_")[:60]
+        gcs_prefix = f"instagram/{dl_date}/{safe_title}"
+
+        client = _storage_client()
+        bkt = client.bucket(BUCKET)
+        uploaded = []
+        video_gcs_path = None
+
+        for fpath in media_files:
+            ext = fpath.suffix.lower()
+            mime = {
+                ".mp4": "video/mp4", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp", ".m4a": "audio/mp4",
+            }.get(ext, "application/octet-stream")
+            gcs_path = f"{gcs_prefix}/{fpath.name}"
+            blob, signed = _save_and_sign(bkt, gcs_path, fpath.read_bytes(), mime, expiry_hours)
+            entry = {"filename": fpath.name, "gcsPath": f"gs://{BUCKET}/{gcs_path}",
+                     "signedUrl": signed, "type": mime}
+            uploaded.append(entry)
+            if ext == ".mp4":
+                video_gcs_path = gcs_path
+
+        # Transcribe video if requested
+        transcript_result = None
+        if transcribe and video_gcs_path:
+            gcs_uri = f"gs://{BUCKET}/{video_gcs_path}"
+            model = GenerativeModel(TRANSCRIBE_MODEL)
+            video_part = Part.from_uri(gcs_uri, mime_type="video/mp4")
+            transcript = model.generate_content([
+                f"Transcribe the speech in this video completely. Language: {language}. "
+                "Include speaker labels if multiple speakers. Output transcript only.",
+                video_part,
+            ]).text
+            txt_gcs = f"{gcs_prefix}/{safe_title}_transcript.txt"
+            txt_blob, txt_url = _save_and_sign(bkt, txt_gcs,
+                                               transcript.encode("utf-8"),
+                                               "text/plain; charset=utf-8", expiry_hours)
+            transcript_result = {
+                "text": transcript,
+                "gcsPath": f"gs://{BUCKET}/{txt_gcs}",
+                "signedUrl": txt_url,
+            }
+
+        return _ok({
+            "status": "success",
+            "url": url,
+            "date": dl_date,
+            "metadata": metadata,
+            "files": uploaded,
+            "transcript": transcript_result,
+        })
+
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "Download timed out (>120s)"})
+    except Exception as e:
+        return _err(e)
+    finally:
+        if tmp_dir and os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        if cookies_file and os.path.exists(cookies_file.name):
+            os.unlink(cookies_file.name)
+
+
+@mcp.tool()
+def set_instagram_cookies(cookies_b64: str) -> str:
+    """Store Instagram cookies in Secret Manager for persistent use by the server.
+    After storing, future calls to download_instagram won't need cookies_b64.
+
+    Args:
+        cookies_b64: Base64-encoded Netscape cookies.txt content
+            How to get: Log into Instagram in Chrome → 'Get cookies.txt LOCALLY' extension
+            → Export for instagram.com → base64 -i cookies.txt | tr -d '\\n'
+    """
+    try:
+        client = secretmanager.SecretManagerServiceClient()
+        parent = f"projects/{PROJECT}"
+        secret_id = "instagram-cookies"
+        secret_name = f"{parent}/secrets/{secret_id}"
+
+        # Create secret if it doesn't exist
+        try:
+            client.get_secret(request={"name": secret_name})
+        except Exception:
+            client.create_secret(request={
+                "parent": parent,
+                "secret_id": secret_id,
+                "secret": {"replication": {"automatic": {}}},
+            })
+
+        # Add new version
+        payload = base64.b64decode(cookies_b64)
+        client.add_secret_version(request={
+            "parent": secret_name,
+            "payload": {"data": payload},
+        })
+
+        # Grant SA access to read it
+        return _ok({
+            "status": "stored",
+            "secret": secret_name,
+            "note": "Cookies stored. Future download_instagram calls will use these automatically.",
+        })
     except Exception as e:
         return _err(e)
 
