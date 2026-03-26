@@ -36,9 +36,8 @@ LOCATION = os.environ.get("GCP_LOCATION",  "us-central1")
 BUCKET   = os.environ.get("AUDIO_BUCKET",  "open-files-app")
 TRANSCRIBE_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro-preview-03-25")
 
-# Nano image model (fast, efficient) — user-overridable
-IMAGE_MODEL_NANO = os.environ.get("IMAGE_MODEL_NANO", "gemini-3.1-flash-image-preview")
-IMAGE_MODEL_PRO  = os.environ.get("IMAGE_MODEL_PRO",  "gemini-3-pro-image-preview")
+# Gemini image generation on Vertex AI — confirmed working model
+IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gemini-3-pro-image-preview")
 
 # Initialise Vertex AI (used for audio transcription)
 vertexai.init(project=PROJECT, location=LOCATION)
@@ -94,8 +93,7 @@ PROMPT_TIPS = {
     "aspect_ratios": list(VALID_ASPECT_RATIOS),
     "image_sizes":   list(VALID_IMAGE_SIZES),
     "models": {
-        "nano (default)": IMAGE_MODEL_NANO + " — fastest, most cost-efficient",
-        "pro":            IMAGE_MODEL_PRO  + " — highest quality, slower",
+        "default": IMAGE_MODEL + " — Gemini image generation on Vertex AI",
     },
 }
 
@@ -302,27 +300,24 @@ def generate_image(
     expiry_hours: int = 48,
     include_text: bool = False,
 ) -> str:
-    """Generate an image with Gemini 2.5 Flash Image (Nano) or Pro via Vertex AI.
+    """Generate an image with gemini-3-pro-image-preview via Vertex AI.
     Saves PNG to gs://open-files-app/generated/YYYY-MM-DD/ and returns signed URL + base64.
 
     Args:
         prompt: Image description (narrative style recommended — see get_prompt_tips)
-        aspect_ratio: One of 1:1 16:9 9:16 4:3 3:4 4:5 5:4 21:9 2:3 3:2 1:4 4:1 1:8 8:1
-        image_size: 512 | 1K | 2K | 4K (512 only on nano)
-        thinking_level: minimal (fast) | high (best quality for complex scenes)
-        model: nano (default, fastest) | pro (highest quality)
+        aspect_ratio: One of 1:1 16:9 9:16 4:3 3:4 4:5 5:4 21:9
+        image_size: 1K | 2K | 4K
+        thinking_level: minimal (fast) | high (best for complex scenes)
+        model: ignored — uses gemini-3-pro-image-preview
         date: YYYY-MM-DD folder (default: today UTC)
         filename: Output filename without extension (default: auto-generated)
         expiry_hours: Signed URL validity hours (default: 48)
-        include_text: Also return a text description alongside the image (default: False)
+        include_text: Also return text description alongside the image (default: False)
     """
     try:
         if aspect_ratio not in VALID_ASPECT_RATIOS:
             return json.dumps({"error": f"Invalid aspect_ratio. Choose from: {sorted(VALID_ASPECT_RATIOS)}"})
-        if image_size not in VALID_IMAGE_SIZES:
-            return json.dumps({"error": f"Invalid image_size. Choose from: {VALID_IMAGE_SIZES}"})
 
-        model_id = IMAGE_MODEL_NANO if model == "nano" else IMAGE_MODEL_PRO
         gen_date = date or _today()
         ts       = datetime.now(timezone.utc).strftime("%H%M%S")
         fname    = (filename or f"img_{ts}") + ".png"
@@ -331,16 +326,22 @@ def generate_image(
         modalities = ["IMAGE", "TEXT"] if include_text else ["IMAGE"]
 
         response = _genai.models.generate_content(
-            model=model_id,
+            model=IMAGE_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
+                temperature=1,
+                top_p=0.95,
                 response_modalities=modalities,
+                safety_settings=[
+                    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",        threshold="OFF"),
+                    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT",   threshold="OFF"),
+                    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT",   threshold="OFF"),
+                    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",          threshold="OFF"),
+                ],
                 image_config=types.ImageConfig(
                     aspect_ratio=aspect_ratio,
                     image_size=image_size,
-                ),
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=-1 if thinking_level == "high" else 0,
+                    output_mime_type="image/png",
                 ),
             ),
         )
@@ -349,7 +350,7 @@ def generate_image(
         text_out   = None
         for part in response.candidates[0].content.parts:
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                image_data = part.inline_data.data  # bytes
+                image_data = part.inline_data.data
             elif hasattr(part, "text") and part.text:
                 text_out = part.text
 
@@ -362,7 +363,7 @@ def generate_image(
 
         result = {
             "status": "success",
-            "model": model_id,
+            "model": IMAGE_MODEL,
             "prompt": prompt,
             "image": {
                 "gcsPath":    f"gs://{BUCKET}/{gcs_path}",
@@ -410,7 +411,6 @@ def edit_image(
         expiry_hours: Signed URL validity hours
     """
     try:
-        model_id = IMAGE_MODEL_NANO if model == "nano" else IMAGE_MODEL_PRO
         gen_date = date or _today()
         ts       = datetime.now(timezone.utc).strftime("%H%M%S")
         fname    = (filename or f"edited_{ts}") + ".png"
@@ -428,16 +428,22 @@ def edit_image(
         img_part = types.Part.from_bytes(data=img_bytes, mime_type=image_mime)
 
         response = _genai.models.generate_content(
-            model=model_id,
+            model=IMAGE_MODEL,
             contents=[prompt, img_part],
             config=types.GenerateContentConfig(
+                temperature=1,
+                top_p=0.95,
                 response_modalities=["IMAGE", "TEXT"],
+                safety_settings=[
+                    types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH",        threshold="OFF"),
+                    types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT",   threshold="OFF"),
+                    types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT",   threshold="OFF"),
+                    types.SafetySetting(category="HARM_CATEGORY_HARASSMENT",          threshold="OFF"),
+                ],
                 image_config=types.ImageConfig(
                     aspect_ratio=aspect_ratio,
                     image_size=image_size,
-                ),
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=-1 if thinking_level == "high" else 0,
+                    output_mime_type="image/png",
                 ),
             ),
         )
@@ -455,7 +461,7 @@ def edit_image(
         _, signed = _save_and_sign(_storage_client().bucket(BUCKET), gcs_path,
                                    image_data, "image/png", expiry_hours)
         result = {
-            "status": "success", "model": model_id, "prompt": prompt,
+            "status": "success", "model": IMAGE_MODEL, "prompt": prompt,
             "image": {
                 "gcsPath": f"gs://{BUCKET}/{gcs_path}",
                 "signedUrl": signed,
